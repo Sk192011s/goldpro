@@ -1,10 +1,3 @@
-// =====================================================
-// R2 M3U8 Streaming Proxy for Deno Deploy
-// Token-free: APK ကနေ link ထည့်ရုံနဲ့ ကြည့်လို့ရ
-// Memory-efficient: pipe/stream based, no full buffering
-// Concurrent: multi-user simultaneous streaming supported
-// =====================================================
-
 const R2_BASE_URL = Deno.env.get("R2_BASE_URL") || "";
 
 const ALLOWED_DOMAINS = [
@@ -16,7 +9,7 @@ const ALLOWED_EXTENSIONS = new Set([
   "m3u8", "ts", "mp4", "fmp4", "m4s", "key", "vtt", "srt",
 ]);
 
-// ---------- Rate Limiting ----------
+// ---------- Rate Limiting (per-IP, sliding window) ----------
 interface RateLimitEntry {
   count: number;
   windowStart: number;
@@ -24,7 +17,11 @@ interface RateLimitEntry {
 
 const rateLimitMap = new Map<string, RateLimitEntry>();
 const RATE_LIMIT_WINDOW = 60_000;
-const RATE_LIMIT_MAX = 600;
+// *** concurrent streaming အတွက် limit ကို မြှင့်ထားပါတယ် ***
+// HLS player က segment တစ်ခုလျှင် request 1 ခုပါတ်တယ်
+// 2-second segments ဆိုရင် 30 req/min/stream, 10 users = 300
+// headroom ထည့်ပြီး 1200 ထားတယ်
+const RATE_LIMIT_MAX = 1200;
 const RATE_LIMIT_CLEANUP_INTERVAL = 2 * 60_000;
 
 setInterval(() => {
@@ -47,15 +44,16 @@ function isRateLimited(ip: string): boolean {
   return entry.count > RATE_LIMIT_MAX;
 }
 
-// ---------- M3U8 Cache ----------
+// ---------- M3U8 Cache (LRU-like) ----------
 interface M3U8CacheEntry {
   raw: string;
   cachedAt: number;
+  lastAccess: number;
 }
 
 const m3u8Cache = new Map<string, M3U8CacheEntry>();
 const M3U8_CACHE_TTL = 5 * 60 * 1000;
-const M3U8_CACHE_MAX_SIZE = 1000;
+const M3U8_CACHE_MAX_SIZE = 2000;
 
 setInterval(() => {
   const now = Date.now();
@@ -68,20 +66,34 @@ setInterval(() => {
 
 function cacheM3U8(key: string, raw: string): void {
   if (m3u8Cache.size >= M3U8_CACHE_MAX_SIZE) {
+    // Evict least recently accessed entry
     let oldestKey: string | null = null;
     let oldestTime = Infinity;
     for (const [k, entry] of m3u8Cache) {
-      if (entry.cachedAt < oldestTime) {
-        oldestTime = entry.cachedAt;
+      if (entry.lastAccess < oldestTime) {
+        oldestTime = entry.lastAccess;
         oldestKey = k;
       }
     }
     if (oldestKey) m3u8Cache.delete(oldestKey);
   }
-  m3u8Cache.set(key, { raw, cachedAt: Date.now() });
+  const now = Date.now();
+  m3u8Cache.set(key, { raw, cachedAt: now, lastAccess: now });
 }
 
-// ---------- Active Connections ----------
+function getCachedM3U8(key: string): M3U8CacheEntry | null {
+  const entry = m3u8Cache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.cachedAt > M3U8_CACHE_TTL) {
+    m3u8Cache.delete(key);
+    return null;
+  }
+  // Update last access for LRU
+  entry.lastAccess = Date.now();
+  return entry;
+}
+
+// ---------- Active Connections (atomic-safe counter) ----------
 let activeConnections = 0;
 const MAX_ACTIVE_CONNECTIONS = 500;
 
@@ -203,7 +215,18 @@ function resolveAndRewriteUri(
       ? currentDir + uri
       : currentDir + "/" + uri;
   }
-  resolvedPath = resolvedPath.replace(/\/+/g, "/");
+  // Normalize path segments (resolve "." and ".." within allowed bounds)
+  const parts = resolvedPath.split("/").filter(Boolean);
+  const stack: string[] = [];
+  for (const part of parts) {
+    if (part === ".") continue;
+    if (part === "..") {
+      stack.pop();
+    } else {
+      stack.push(part);
+    }
+  }
+  resolvedPath = "/" + stack.join("/");
   return `${proxyBase}/stream${resolvedPath}`;
 }
 
@@ -248,7 +271,7 @@ function rewriteM3U8(
   return out.join("\n");
 }
 
-// ---------- Stream from R2 ----------
+// ---------- Stream from R2 (pipe-based, concurrent-safe) ----------
 
 async function streamFromR2(
   r2Path: string,
@@ -270,10 +293,18 @@ async function streamFromR2(
       const reqHeaders: Record<string, string> = {};
       if (rangeHeader) reqHeaders["Range"] = rangeHeader;
 
-      const r2Resp = await fetch(r2Url, {
-        headers: reqHeaders,
-        signal: AbortSignal.timeout(30_000),
-      });
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 30_000);
+
+      let r2Resp: Response;
+      try {
+        r2Resp = await fetch(r2Url, {
+          headers: reqHeaders,
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timeoutId);
+      }
 
       if (r2Resp.status === 404) {
         return new Response("Not Found", { status: 404, headers: corsHeaders() });
@@ -294,27 +325,45 @@ async function streamFromR2(
       const cr = r2Resp.headers.get("Content-Range");
       if (cr) respHeaders["Content-Range"] = cr;
 
+      // Cache headers based on content type
       if (r2Path.endsWith(".ts") || r2Path.endsWith(".m4s") || r2Path.endsWith(".fmp4")) {
         respHeaders["Cache-Control"] = "public, max-age=86400, immutable";
       } else if (r2Path.endsWith(".mp4")) {
         respHeaders["Cache-Control"] = "public, max-age=3600";
+      } else if (r2Path.endsWith(".key")) {
+        respHeaders["Cache-Control"] = "public, max-age=86400, immutable";
       }
 
+      // No body (HEAD request or empty response)
       if (!r2Resp.body) {
         return new Response(null, { status: r2Resp.status, headers: respHeaders });
       }
 
-      const { readable, writable } = new TransformStream();
-      (async () => {
-        activeConnections++;
-        try {
-          await r2Resp.body!.pipeTo(writable);
-        } catch (_e) {
-          try { await writable.abort(_e instanceof Error ? _e.message : "pipe error"); } catch { /* ignore */ }
-        } finally {
+      // *** Pipe with proper connection tracking ***
+      activeConnections++;
+      const reader = r2Resp.body.getReader();
+
+      const readable = new ReadableStream({
+        async pull(ctrl) {
+          try {
+            const { done, value } = await reader.read();
+            if (done) {
+              ctrl.close();
+              activeConnections--;
+              return;
+            }
+            ctrl.enqueue(value);
+          } catch (_e) {
+            ctrl.close();
+            activeConnections--;
+          }
+        },
+        cancel() {
+          // Client disconnected — release resources
+          reader.cancel().catch(() => {});
           activeConnections--;
-        }
-      })();
+        },
+      });
 
       return new Response(readable, { status: r2Resp.status, headers: respHeaders });
     } catch (err) {
@@ -337,9 +386,9 @@ async function handleM3U8(
   const currentDir = getDirectoryFromPath(r2Path);
   const m3u8ContentType = getContentType(r2Path, userAgent);
 
-  // Cache hit
-  const cached = m3u8Cache.get(r2Path);
-  if (cached && Date.now() - cached.cachedAt < M3U8_CACHE_TTL) {
+  // Cache hit (with LRU update)
+  const cached = getCachedM3U8(r2Path);
+  if (cached) {
     return new Response(rewriteM3U8(cached.raw, proxyBase, currentDir), {
       status: 200,
       headers: {
@@ -356,7 +405,16 @@ async function handleM3U8(
 
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const resp = await fetch(r2Url, { signal: AbortSignal.timeout(15_000) });
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15_000);
+
+      let resp: Response;
+      try {
+        resp = await fetch(r2Url, { signal: controller.signal });
+      } finally {
+        clearTimeout(timeoutId);
+      }
+
       if (resp.status === 404) {
         return new Response("Not Found", { status: 404, headers: corsHeaders() });
       }
@@ -413,7 +471,7 @@ async function handleRequest(req: Request): Promise<Response> {
     });
   }
 
-  // Health
+  // Health / status
   if (path === "/" || path === "/health") {
     return new Response(
       JSON.stringify({
@@ -421,13 +479,14 @@ async function handleRequest(req: Request): Promise<Response> {
         active_streams: activeConnections,
         max_connections: MAX_ACTIVE_CONNECTIONS,
         m3u8_cache_entries: m3u8Cache.size,
+        rate_limit_entries: rateLimitMap.size,
         timestamp: new Date().toISOString(),
       }),
       { headers: { "Content-Type": "application/json", ...corsHeaders() } },
     );
   }
 
-  // Stream proxy - NO AUTH REQUIRED
+  // Stream proxy — NO AUTH REQUIRED
   if (path.startsWith("/stream/")) {
     if (!validateConfig()) {
       return new Response("Server misconfigured", { status: 500, headers: corsHeaders() });
@@ -555,7 +614,8 @@ async function handleRequest(req: Request): Promise<Response> {
           bufferInfo = (video.buffered.end(video.buffered.length - 1) - video.currentTime).toFixed(1) + "s";
         }
         stats.textContent = "Level: " + (level ? level.height + "p" : "-")
-          + " | Buffer: " + bufferInfo;
+          + " | Buffer: " + bufferInfo
+          + " | Streams: active";
       }, 1000);
 
     } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
