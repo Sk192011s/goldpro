@@ -11,7 +11,7 @@ const R2_BASE_URL = Deno.env.get("R2_BASE_URL") || "";
 const API_KEY = Deno.env.get("PROXY_API_KEY") || "";
 
 const ALLOWED_DOMAINS = [
-  "",
+  "pub-cbf23f7a9f914d1a88f8f1cf741716db.r2.dev","pub-9c8bcd6f32434fe08628852555cc2e5c.r2.dev",
 ];
 
 // Allowed file extensions for streaming
